@@ -45,18 +45,23 @@ def parse_args():
     p.add_argument("--max_episodes",       type=int, default=100000)
     p.add_argument("--eval_every",         type=int, default=512)
     p.add_argument("--save_every",         type=int, default=1024)
-    p.add_argument("--reward_em_weight",          type=float, default=1.0)
-    p.add_argument("--reward_f1_weight",          type=float, default=0.5)
-    p.add_argument("--reward_sf_weight",          type=float, default=0.5)
-    p.add_argument("--reward_step_weight",        type=float, default=0.1)
-    p.add_argument("--reward_early_stop_penalty", type=float, default=0.3)
-    p.add_argument("--reward_min_hops",           type=int,   default=2)
+    p.add_argument("--reward_em_weight",          type=float, default=0.3)
+    p.add_argument("--reward_f1_weight",          type=float, default=0.2)
+    p.add_argument("--reward_sf_weight",          type=float, default=1.0)
+    p.add_argument("--reward_joint_bonus",        type=float, default=0.5)
+    p.add_argument("--reward_step_weight",        type=float, default=0.2)
+    p.add_argument("--reward_early_stop_penalty", type=float, default=0.0)  # ⑥ 已无效，保留兼容
+    p.add_argument("--reward_min_hops",           type=int,   default=2)    # ⑥ 已无效，保留兼容
     p.add_argument("--use_step_reward", action="store_true", default=True)
     p.add_argument("--seed",       type=int, default=42)
     p.add_argument("--device",     default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--output_dir", default="outputs")
     p.add_argument("--checkpoint", default=None)
     p.add_argument("--recall_k",   type=int, nargs="+", default=[1,2,5,10])
+    p.add_argument("--ref_update_every", type=int, default=200,
+                   help="每隔多少 global_step 更新一次 KL 参考策略（0=不更新）")  # ③
+    p.add_argument("--beam_size",  type=int, default=3,
+                   help="评测时 beam search 的 beam 数（1=greedy）")              # ⑧
     return p.parse_args()
 
 
@@ -105,11 +110,13 @@ def main():
         top_k=args.top_k, max_hops=args.max_hops,
         retrieval_mode=args.retrieval_mode,
         reward_config={
+            "sf_weight":            args.reward_sf_weight,
+            "joint_bonus":          args.reward_joint_bonus,
             "em_weight":            args.reward_em_weight,
             "f1_weight":            args.reward_f1_weight,
-            "sf_weight":            args.reward_sf_weight,
             "step_weight":          args.reward_step_weight,
             "use_step_reward":      args.use_step_reward,
+            # 兼容字段（⑥ 已无效）
             "early_stop_penalty":   args.reward_early_stop_penalty,
             "min_hops_before_stop": args.reward_min_hops,
         }
@@ -145,6 +152,7 @@ def main():
             grad_accum_steps=args.grad_accum_steps,
             output_dir=args.output_dir, device=args.device,
             eval_every=args.eval_every, save_every=args.save_every,
+            ref_update_every=args.ref_update_every,  # ③
         )
         trainer.train(
             train_data=train_data, dev_data=dev_data,
@@ -156,12 +164,30 @@ def main():
     elif args.mode == "eval":
         from eval_greedy_baseline import evaluate_bm25_greedy, print_table
         hotpot_evaluator = HotpotEvaluator()
+        logger.info("="*60)
+        logger.info("Starting evaluation on dev set")
+        logger.info("="*60)
+
+        logger.info("\n[1/3] Evaluating RL policy (greedy)...")
         rl_m = hotpot_evaluator.evaluate(policy=policy, env=env, dataset=dev_data, mode="rl")
-        logger.info(f"RL: {json.dumps(rl_m, indent=2)}")
+
+        logger.info("\n[2/3] Evaluating RL policy (beam search)...")
+        beam_m = evaluator.evaluate(policy, env, dev_data, mode="beam",
+                                    beam_size=args.beam_size, max_samples=500)
+        logger.info(f"RL beam (size={args.beam_size}): {json.dumps(beam_m, indent=2)}")
+
+        logger.info("\n[3/3] Evaluating BM25 greedy baseline...")
         bm_m = evaluate_bm25_greedy(dev_data.data, reader, max_hops=args.max_hops)
         print_table(bm_m, "BM25 Greedy (Context Oracle)")
-        json.dump({"rl": rl_m, "bm25": bm_m},
+
+        logger.info("\n" + "="*60)
+        logger.info("Evaluation complete. Saving results...")
+        logger.info("="*60)
+        os.makedirs(args.output_dir, exist_ok=True)
+        results = {"rl_greedy": rl_m, "rl_beam": beam_m, "bm25": bm_m}
+        json.dump(results,
                   open(os.path.join(args.output_dir, "eval_results.json"), "w"), indent=2)
+        logger.info(f"Results saved to {args.output_dir}/eval_results.json")
 
 
 if __name__ == "__main__":

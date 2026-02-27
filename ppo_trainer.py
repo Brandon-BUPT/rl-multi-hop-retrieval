@@ -65,6 +65,7 @@ class PPOTrainer:
         grad_accum_steps=4, value_loss_coef=0.5, entropy_coef=0.05,
         max_grad_norm=1.0, output_dir="outputs", device="cpu",
         eval_every=512, save_every=1024,
+        ref_update_every=200,  # ③ 每隔多少 global_step 更新一次参考策略
     ):
         self.policy = policy
         self.env = env
@@ -85,6 +86,7 @@ class PPOTrainer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.eval_every = eval_every
         self.save_every = save_every
+        self.ref_update_every = ref_update_every  # ③
 
         # 差异化学习率：encoder 慢，其余正常
         enc_ids = set(id(p) for p in policy.state_encoder.parameters())
@@ -102,6 +104,7 @@ class PPOTrainer:
             self.ref_policy = copy.deepcopy(policy)
             for p in self.ref_policy.parameters(): p.requires_grad = False
             self.ref_policy.eval()
+            logger.info(f"KL ref_policy enabled, will update every {ref_update_every} steps")
         else:
             self.ref_policy = None
 
@@ -353,6 +356,17 @@ class PPOTrainer:
                 upd = self.update()
                 self.buffer.clear()
                 self.global_step += 1
+
+                # ③ 周期性更新 KL 参考策略
+                # 固定初始参考策略会随训练推进导致 KL 越来越大从而限制探索；
+                # 每隔 ref_update_every 步将当前策略快照为新的参考策略。
+                if (self.ref_policy is not None
+                        and self.ref_update_every > 0
+                        and self.global_step % self.ref_update_every == 0):
+                    self.ref_policy.load_state_dict(
+                        copy.deepcopy(self.policy.state_dict())
+                    )
+                    logger.info(f"[Step {self.global_step}] ref_policy updated")
 
                 if self.global_step % 10 == 0:
                     W = self.rollout_batch_size * 10

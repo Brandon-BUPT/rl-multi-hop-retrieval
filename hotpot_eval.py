@@ -74,7 +74,11 @@ class HotpotEvaluator:
             import random
             data = random.sample(data, min(max_samples, len(data)))
         results = defaultdict(list)
-        for item in data:
+        total = len(data)
+        logger.info(f"Starting evaluation: {total} samples, mode={mode}")
+        for idx, item in enumerate(data):
+            if (idx + 1) % 500 == 0 or idx == 0:
+                logger.info(f"Progress: {idx + 1}/{total} ({100*(idx+1)/total:.1f}%)")
             for k, v in self._run(policy, env, item, mode).items():
                 results[k].append(v)
         policy.train()

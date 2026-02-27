@@ -37,17 +37,10 @@ import torch
 
 from environment import MultiHopRetrievalEnv
 ```
-- Import inside functions for heavy dependencies (transformers, faiss) when needed
+- Import heavy dependencies (transformers, faiss) inside functions when needed
 
-### Type Hints
-- Use `typing` module for all function signatures
-```python
-from typing import Dict, List, Optional, Tuple
-
-def encode_state(self, question: str, selected_docs: List[Dict]) -> torch.Tensor:
-```
-
-### Naming Conventions
+### Type Hints & Naming
+- Use `typing` module for all function signatures: `from typing import Dict, List, Optional, Tuple`
 - Classes: PascalCase (`PolicyNetwork`, `MultiHopRetrievalEnv`)
 - Functions/variables: snake_case (`compute_gae`, `encode_state`)
 - Constants: UPPER_CASE at module level (`STOP_ACTION = -1`)
@@ -55,7 +48,7 @@ def encode_state(self, question: str, selected_docs: List[Dict]) -> torch.Tensor
 
 ### Docstrings
 - Module-level docstring with purpose
-- Function docstrings with Args/Returns format
+- Function docstrings with Args/Returns format:
 ```python
 """
 Multi-hop Retrieval MDP Environment
@@ -64,22 +57,13 @@ State: (question, list of selected documents so far)
 Action: select one of top-K candidates, or STOP
 """
 
-def compute_gae(
-    rewards: List[float],
-    values: List[float],
-    dones: List[bool],
-    gamma: float = 0.99,
-    gae_lambda: float = 0.95,
-) -> Tuple[List[float], List[float]]:
+def compute_gae(...) -> Tuple[List[float], List[float]]:
     """Compute Generalized Advantage Estimation. Returns (advantages, returns)."""
 ```
 
-### Logging
-- Use `logging` module, not `print()`
-- Initialize logger at module level: `logger = logging.getLogger(__name__)`
+### Logging & Error Handling
+- Use `logging` module, not `print()`. Initialize: `logger = logging.getLogger(__name__)`
 - Main.py configures basic logging format globally
-
-### Error Handling
 - Try/except for external dependencies and file I/O
 - Log warnings/errors, provide graceful fallbacks
 - Raise RuntimeError with descriptive messages for invalid states
@@ -91,23 +75,14 @@ def compute_gae(
 - Initialize weights with `xavier_uniform_` and zero biases
 - Use `nn.Sequential` for simple feedforward stacks
 
-### File Structure
+### File Structure & Formatting
 - Each module has single responsibility (data_utils.py, retriever.py, environment.py)
 - Main.py orchestrates imports and argument parsing
-- Constants defined at module level or in dataclasses
+- Constants at module level or in dataclasses
 - Use `pathlib.Path` for file paths
-
-### Data Structures
 - Use `dataclass` for state/structured data (`RetrievalState`)
-- Dict returns for metrics/results
-- Lists for sequential data
-- Tuples for fixed-size returns
-
-### Formatting
-- 4-space indentation
-- Line length ~88-100 characters (compatible with black)
-- Blank lines between functions and logical sections
-- One statement per line
+- 4-space indentation, line length ~88-100 characters (black-compatible)
+- Blank lines between functions and logical sections, one statement per line
 
 ### Configuration & Argument Parsing
 - Use `argparse` for CLI arguments (see main.py:parse_args)
@@ -130,31 +105,21 @@ def compute_gae(
 - Support `max_samples` parameter for quick debugging
 - Return dict of aggregate metrics (mean across dataset)
 
-### State Management
-- Use `@dataclass` for structured state (RetrievalState)
-- Store metadata (ids, titles) alongside tensors
-- Use field(default_factory=list) for mutable defaults
-- Include done flag for episode termination
-
 ### Checkpointing
-- Use `torch.save(model.state_dict(), path)` for saving
-- Use `model.load_state_dict(torch.load(path, map_location=device))` for loading
+- Save: `torch.save(model.state_dict(), path)`
+- Load: `model.load_state_dict(torch.load(path, map_location=device))`
 - Check `checkpoint` argument to conditionally load models
 - Save both intermediate and final checkpoints
 
 ### Warnings & Filtering
-- Filter transformer overflow warnings to reduce noise:
+- Filter transformer overflow warnings:
 ```python
-warnings.filterwarnings(
-    "ignore",
-    message=".*overflowing tokens are not returned.*",
-    category=UserWarning,
-)
+warnings.filterwarnings("ignore", message=".*overflowing tokens are not returned.*", category=UserWarning)
 ```
 
-### GPU Optimization Patterns
+### GPU Optimization
 - Batch encode states/docs to maximize GPU utilization (see ppo_trainer.py:172)
-- Use `torch.no_grad()` context for all inference during rollout
+- Use `torch.no_grad()` for all inference during rollout
 - Implement gradient accumulation for larger effective batch sizes
 - Pad variable-length sequences within batches for parallel processing
 - Store tensors on CPU in buffers after detaching gradients

@@ -85,18 +85,25 @@ def bm25_select(query, pool, exclude):
 
 def evaluate_bm25_greedy(data, reader, max_hops=2):
     results = defaultdict(list)
-    for item in data:
+    total = len(data)
+    logger.info(f"Starting BM25 greedy evaluation: {total} samples")
+    for idx, item in enumerate(data):
+        if (idx + 1) % 500 == 0 or idx == 0:
+            logger.info(f"BM25 progress: {idx + 1}/{total} ({100*(idx+1)/total:.1f}%)")
         pool = [{"title": t, "text": " ".join(s)} for t, s in item.get("context", [])]
-        gt = set(sf[0] for sf in item["supporting_facts"])
-        gf = [(sf[0], sf[1]) for sf in item["supporting_facts"]]
-        sel_docs, sel_titles = [], []
+        gold_titles = set(sf[0] for sf in item["supporting_facts"])
+        gold_facts  = [(sf[0], sf[1]) for sf in item["supporting_facts"]]
+        selected_docs, selected_titles = [], []
         for hop in range(max_hops):
-            q = item["question"] + (" " + " ".join(sel_titles) if sel_titles else "")
-            d = bm25_select(q, pool, set(sel_titles))
-            if d is None: break
-            sel_docs.append(d); sel_titles.append(d["title"])
-        pred = reader.predict(item["question"], sel_docs) if sel_docs else ""
-        for k, v in metrics(sel_docs, sel_titles, pred, item["answer"], gt, gf).items():
+            query = item["question"] + (" " + " ".join(selected_titles) if selected_titles else "")
+            doc = bm25_select(query, pool, set(selected_titles))
+            if doc is None: break
+            selected_docs.append(doc); selected_titles.append(doc["title"])
+        predicted = reader.predict(item["question"], selected_docs) if selected_docs else ""
+        for k, v in metrics(                          # ← 修复：compute_metrics → metrics
+            selected_docs, selected_titles, predicted,
+            item["answer"], gold_titles, gold_facts
+        ).items():
             results[k].append(v)
     return {k: float(np.mean(v)) for k, v in results.items()}
 

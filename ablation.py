@@ -28,9 +28,9 @@ ABLATION_CONFIGS = {
         "kl_coef": 0.1,
         "use_step_reward": True,
         "reward_config": {
-            "em_weight": 1.0, "f1_weight": 0.5,
-            "sf_weight": 0.3, "step_weight": 0.1,
-            "use_step_reward": True,
+            "sf_weight": 1.0, "joint_bonus": 0.5,
+            "em_weight": 0.3, "f1_weight": 0.2,
+            "step_weight": 0.2, "use_step_reward": True,
         }
     },
     "no_kl": {
@@ -38,9 +38,9 @@ ABLATION_CONFIGS = {
         "kl_coef": 0.0,
         "use_step_reward": True,
         "reward_config": {
-            "em_weight": 1.0, "f1_weight": 0.5,
-            "sf_weight": 0.3, "step_weight": 0.1,
-            "use_step_reward": True,
+            "sf_weight": 1.0, "joint_bonus": 0.5,
+            "em_weight": 0.3, "f1_weight": 0.2,
+            "step_weight": 0.2, "use_step_reward": True,
         }
     },
     "no_step_reward": {
@@ -48,9 +48,9 @@ ABLATION_CONFIGS = {
         "kl_coef": 0.1,
         "use_step_reward": False,
         "reward_config": {
-            "em_weight": 1.0, "f1_weight": 0.5,
-            "sf_weight": 0.3, "step_weight": 0.0,
-            "use_step_reward": False,
+            "sf_weight": 1.0, "joint_bonus": 0.5,
+            "em_weight": 0.3, "f1_weight": 0.2,
+            "step_weight": 0.0, "use_step_reward": False,
         }
     },
     "sparse_reward": {
@@ -58,9 +58,10 @@ ABLATION_CONFIGS = {
         "kl_coef": 0.1,
         "use_step_reward": False,
         "reward_config": {
-            "em_weight": 1.0, "f1_weight": 0.0,
-            "sf_weight": 0.0, "step_weight": 0.0,
-            "use_step_reward": False,
+            # 只保留 joint_recall bonus，去掉所有连续信号
+            "sf_weight": 0.0, "joint_bonus": 1.0,
+            "em_weight": 0.0, "f1_weight": 0.0,
+            "step_weight": 0.0, "use_step_reward": False,
         }
     },
     "dense_reward": {
@@ -68,9 +69,20 @@ ABLATION_CONFIGS = {
         "kl_coef": 0.1,
         "use_step_reward": True,
         "reward_config": {
-            "em_weight": 1.0, "f1_weight": 0.5,
-            "sf_weight": 0.5, "step_weight": 0.3,
-            "use_step_reward": True,
+            "sf_weight": 1.0, "joint_bonus": 0.5,
+            "em_weight": 0.5, "f1_weight": 0.3,
+            "step_weight": 0.4, "use_step_reward": True,
+        }
+    },
+    # 新增：纯检索奖励（完全去掉答案 bonus，隔离 reader 误差影响）
+    "retrieval_only": {
+        "use_kl": True,
+        "kl_coef": 0.1,
+        "use_step_reward": True,
+        "reward_config": {
+            "sf_weight": 1.0, "joint_bonus": 0.5,
+            "em_weight": 0.0, "f1_weight": 0.0,
+            "step_weight": 0.2, "use_step_reward": True,
         }
     },
 }
