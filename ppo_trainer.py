@@ -1,7 +1,15 @@
 """
-PPO Trainer — 单塔架构，批量并行 Rollout + 梯度累积
+PPO Trainer — 重构版（适配新 backend-agnostic policy）
+
+主要改动：
+  ① _encode_states / _encode_docs 改用 policy._encode_with_grad / _encode_text
+     不再假设 policy.state_encoder 存在（旧 DPR 接口）
+  ② 差异化学习率：自动区分 transformer 层和投影层
+  ③ 其余训练逻辑（GAE、PPO clip、KL 惩罚、grad accum）保持不变
 """
-import copy, logging, random
+import copy
+import logging
+import random
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -58,14 +66,27 @@ class RolloutBuffer:
 class PPOTrainer:
 
     def __init__(
-        self, policy, env: MultiHopRetrievalEnv,
-        lr=1e-5, ppo_epochs=4, clip_epsilon=0.2, kl_coef=0.1,
-        gamma=0.99, gae_lambda=0.95,
-        batch_size=16, rollout_batch_size=64, encode_batch_size=64,
-        grad_accum_steps=4, value_loss_coef=0.5, entropy_coef=0.05,
-        max_grad_norm=1.0, output_dir="outputs", device="cpu",
-        eval_every=512, save_every=1024,
-        ref_update_every=200,  # ③ 每隔多少 global_step 更新一次参考策略
+        self,
+        policy,
+        env: MultiHopRetrievalEnv,
+        lr=1e-5,
+        ppo_epochs=4,
+        clip_epsilon=0.2,
+        kl_coef=0.1,
+        gamma=0.99,
+        gae_lambda=0.95,
+        batch_size=16,
+        rollout_batch_size=64,
+        encode_batch_size=64,
+        grad_accum_steps=4,
+        value_loss_coef=0.5,
+        entropy_coef=0.05,
+        max_grad_norm=1.0,
+        output_dir="outputs",
+        device="cpu",
+        eval_every=512,
+        save_every=1024,
+        ref_update_every=200,
     ):
         self.policy = policy
         self.env = env
@@ -86,25 +107,27 @@ class PPOTrainer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.eval_every = eval_every
         self.save_every = save_every
-        self.ref_update_every = ref_update_every  # ③
+        self.ref_update_every = ref_update_every
 
-        # 差异化学习率：encoder 慢，其余正常
-        enc_ids = set(id(p) for p in policy.state_encoder.parameters())
-        enc_trainable = [p for p in policy.state_encoder.parameters() if p.requires_grad]
-        other_params  = [p for p in policy.parameters()
-                         if p.requires_grad and id(p) not in enc_ids]
+        # ── 差异化学习率 ──────────────────────────────────────────────────
+        # 自动识别 transformer 参数 vs 投影头参数
+        transformer_params, other_params = self._split_param_groups()
         self.optimizer = AdamW([
-            {"params": enc_trainable, "lr": lr * 0.1},
-            {"params": other_params,  "lr": lr},
+            {"params": transformer_params, "lr": lr * 0.1},
+            {"params": other_params, "lr": lr},
         ], weight_decay=1e-4)
-        logger.info(f"Optimizer: encoder {len(enc_trainable)} (lr={lr*0.1:.1e}), "
-                    f"other {len(other_params)} (lr={lr:.1e})")
+        logger.info(
+            f"Optimizer: transformer {len(transformer_params)} params (lr={lr*0.1:.1e}), "
+            f"other {len(other_params)} params (lr={lr:.1e})"
+        )
 
+        # ── KL 参考策略 ──────────────────────────────────────────────────
         if kl_coef > 0:
             self.ref_policy = copy.deepcopy(policy)
-            for p in self.ref_policy.parameters(): p.requires_grad = False
+            for p in self.ref_policy.parameters():
+                p.requires_grad = False
             self.ref_policy.eval()
-            logger.info(f"KL ref_policy enabled, will update every {ref_update_every} steps")
+            logger.info(f"KL ref_policy enabled, update every {ref_update_every} steps")
         else:
             self.ref_policy = None
 
@@ -112,28 +135,51 @@ class PPOTrainer:
         self.global_step = 0
         self.metrics_history = defaultdict(list)
 
+    def _split_param_groups(self):
+        """分离 transformer 参数和头部参数，用于差异化学习率"""
+        transformer = self.policy._transformer
+        if transformer is None:
+            # 没有可识别的 transformer，全部用统一 lr
+            return [], [p for p in self.policy.parameters() if p.requires_grad]
+
+        transformer_ids = set(id(p) for p in transformer.parameters())
+        transformer_params = [p for p in transformer.parameters() if p.requires_grad]
+        other_params = [
+            p for p in self.policy.parameters()
+            if p.requires_grad and id(p) not in transformer_ids
+        ]
+        return transformer_params, other_params
+
     # ── Encoding ──────────────────────────────────────────────────────────
 
-    def _encode_states(self, texts: List[str], hops: List[int],
-                       grad: bool = False) -> torch.Tensor:
+    def _encode_states(
+        self,
+        texts: List[str],
+        hops: List[int],
+        grad: bool = False,
+    ) -> torch.Tensor:
+        """
+        批量编码状态文本，返回 (N, hidden_dim)。
+        grad=True 时允许梯度传播（PPO update 时）。
+        """
         all_vecs = []
-        for i in range(0, len(texts), self.encode_batch_size):
-            bt = texts[i:i+self.encode_batch_size]
-            bh = hops[i:i+self.encode_batch_size]
-            enc = self.policy.tokenizer(
-                bt, max_length=512, truncation=True, padding=True, return_tensors="pt"
-            ).to(self.device)
+        bs = self.encode_batch_size
+
+        for i in range(0, len(texts), bs):
+            bt = texts[i : i + bs]
+            bh = hops[i : i + bs]
+
             if grad:
-                out = self.policy.state_encoder(**enc)
+                vecs = self.policy._encode_with_grad(bt, max_length=512)
             else:
                 with torch.no_grad():
-                    out = self.policy.state_encoder(**enc)
-            h = (out.pooler_output if (hasattr(out, "pooler_output") and out.pooler_output is not None)
-                 else out.last_hidden_state[:, 0, :])
-            vecs = self.policy.state_proj(h)
+                    vecs = self.policy._encode_text(bt, max_length=512)
+
+            # Hop embedding
             hop_idx = torch.tensor([min(x, 3) for x in bh], device=self.device)
             vecs = vecs + self.policy.hop_embedding(hop_idx)
             all_vecs.append(vecs)
+
         return torch.cat(all_vecs, dim=0)
 
     @torch.no_grad()
@@ -141,16 +187,13 @@ class PPOTrainer:
         """单塔：文档和 state 用同一 encoder + state_proj"""
         all_embs = []
         bs = self.encode_batch_size * 2
+
         for i in range(0, len(docs), bs):
-            batch = docs[i:i+bs]
+            batch = docs[i : i + bs]
             texts = [f"{d['title']}. {d['text'][:400]}" for d in batch]
-            enc = self.policy.tokenizer(
-                texts, max_length=256, truncation=True, padding=True, return_tensors="pt"
-            ).to(self.device)
-            out = self.policy.state_encoder(**enc)
-            h = (out.pooler_output if (hasattr(out, "pooler_output") and out.pooler_output is not None)
-                 else out.last_hidden_state[:, 0, :])
-            all_embs.append(self.policy.state_proj(h))
+            embs = self.policy._encode_text(texts, max_length=256)
+            all_embs.append(embs)
+
         return torch.cat(all_embs, dim=0)
 
     # ── Rollout ───────────────────────────────────────────────────────────
@@ -163,8 +206,11 @@ class PPOTrainer:
         active = list(range(N))
 
         while active:
-            texts = [build_state_text(states[i].question, states[i].selected_docs) for i in active]
-            hops  = [len(states[i].selected_docs) for i in active]
+            texts = [
+                build_state_text(states[i].question, states[i].selected_docs)
+                for i in active
+            ]
+            hops = [len(states[i].selected_docs) for i in active]
             has_cands = [len(states[i].candidates) > 0 for i in active]
 
             state_vecs = self._encode_states(texts, hops)
@@ -184,7 +230,7 @@ class PPOTrainer:
                 offset = 0
                 for j, sz in enumerate(sizes):
                     if sz > 0:
-                        cand_embs_list[j] = all_embs[offset:offset+sz]
+                        cand_embs_list[j] = all_embs[offset : offset + sz]
                         offset += sz
 
             # 批量 forward
@@ -196,7 +242,9 @@ class PPOTrainer:
                 for j in has_idx:
                     ce = cand_embs_list[j]
                     if ce.shape[0] < max_k:
-                        ce = torch.cat([ce, torch.zeros(max_k-ce.shape[0], ce.shape[1], device=self.device)])
+                        ce = torch.cat(
+                            [ce, torch.zeros(max_k - ce.shape[0], ce.shape[1], device=self.device)]
+                        )
                     padded.append(ce.unsqueeze(0))
                 batch_cands = torch.cat(padded, dim=0)
                 batch_svecs = state_vecs[has_idx]
@@ -204,7 +252,7 @@ class PPOTrainer:
                     logits, vals = self.policy.forward(batch_svecs, batch_cands)
                     dist = torch.distributions.Categorical(logits=logits)
                     acts = dist.sample()
-                    lps  = dist.log_prob(acts)
+                    lps = dist.log_prob(acts)
 
             next_active = []
             ptr = 0
@@ -213,7 +261,8 @@ class PPOTrainer:
                 sv = state_vecs[j].unsqueeze(0)
                 if has_cands[j]:
                     av, lv, vv = acts[ptr].item(), lps[ptr].item(), vals[ptr].item()
-                    ce = cand_embs_list[j]; ptr += 1
+                    ce = cand_embs_list[j]
+                    ptr += 1
                 else:
                     av = lv = vv = 0
                     ce = torch.zeros(1, self.policy.hidden_dim, device=self.device)
@@ -221,17 +270,21 @@ class PPOTrainer:
                 env_action = STOP_ACTION if av >= len(s.candidates) else av
                 s, reward, done, info = self.env.step(s, env_action)
                 states[i] = s
-                local_trans[i].append((texts[j], hops[j], sv.cpu(), ce.cpu(),
-                                       av, lv, reward, vv, done))
-                if done: ep_infos[i] = info
-                else: next_active.append(i)
+                local_trans[i].append(
+                    (texts[j], hops[j], sv.cpu(), ce.cpu(), av, lv, reward, vv, done)
+                )
+                if done:
+                    ep_infos[i] = info
+                else:
+                    next_active.append(i)
             active = next_active
 
         ep_results = []
         for i in range(N):
             trans = local_trans[i]
-            if not trans: continue
-            rews  = [t[6] for t in trans]
+            if not trans:
+                continue
+            rews = [t[6] for t in trans]
             vals_ = [t[7] for t in trans]
             dones = [t[8] for t in trans]
             advs, rets = compute_gae(rews, vals_, dones, self.gamma, self.gae_lambda)
@@ -255,19 +308,24 @@ class PPOTrainer:
     # ── PPO Update ────────────────────────────────────────────────────────
 
     def update(self) -> Dict:
-        if not self.buffer: return {}
+        if not self.buffer:
+            return {}
         N = len(self.buffer)
         actions    = torch.tensor(self.buffer.actions,   device=self.device)
         old_lps    = torch.tensor(self.buffer.log_probs, device=self.device)
-        advantages = torch.tensor([i["advantage"] for i in self.buffer.infos], device=self.device)
-        returns    = torch.tensor([i["return"]    for i in self.buffer.infos], device=self.device)
+        advantages = torch.tensor(
+            [i["advantage"] for i in self.buffer.infos], device=self.device
+        )
+        returns = torch.tensor(
+            [i["return"] for i in self.buffer.infos], device=self.device
+        )
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         max_k = max(ce.shape[0] for ce in self.buffer.cand_embs)
         padded = []
         for ce in self.buffer.cand_embs:
             if ce.shape[0] < max_k:
-                ce = torch.cat([ce, torch.zeros(max_k-ce.shape[0], ce.shape[1])], dim=0)
+                ce = torch.cat([ce, torch.zeros(max_k - ce.shape[0], ce.shape[1])], dim=0)
             padded.append(ce.unsqueeze(0))
         all_cands_cpu = torch.cat(padded, dim=0)
 
@@ -282,21 +340,26 @@ class PPOTrainer:
             accum = 0
 
             for start in range(0, N, self.batch_size):
-                bidx = idx[start:start+self.batch_size]
-                if not bidx: continue
+                bidx = idx[start : start + self.batch_size]
+                if not bidx:
+                    continue
 
-                b_states = self._encode_states([texts[i] for i in bidx],
-                                               [hops[i]  for i in bidx], grad=True)
-                b_cands  = all_cands_cpu[bidx].to(self.device)
-                b_acts   = actions[bidx]
-                b_olps   = old_lps[bidx]
-                b_adv    = advantages[bidx]
-                b_ret    = returns[bidx]
+                b_states = self._encode_states(
+                    [texts[i] for i in bidx],
+                    [hops[i] for i in bidx],
+                    grad=True,
+                )
+                b_cands = all_cands_cpu[bidx].to(self.device)
+                b_acts  = actions[bidx]
+                b_olps  = old_lps[bidx]
+                b_adv   = advantages[bidx]
+                b_ret   = returns[bidx]
 
                 _, new_lps, entropy, values = self.policy.get_action_and_value(
-                    b_states, b_cands, b_acts)
+                    b_states, b_cands, b_acts
+                )
                 ratio    = (new_lps - b_olps).exp()
-                clip_adv = torch.clamp(ratio, 1-self.clip_epsilon, 1+self.clip_epsilon) * b_adv
+                clip_adv = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * b_adv
                 pol_loss = -torch.min(ratio * b_adv, clip_adv).mean()
                 val_loss = F.mse_loss(values.squeeze(-1), b_ret)
                 ent_loss = -entropy.mean()
@@ -306,13 +369,18 @@ class PPOTrainer:
                     with torch.no_grad():
                         ref_logits, _ = self.ref_policy.forward(b_states.detach(), b_cands)
                     curr_logits, _ = self.policy.forward(b_states, b_cands)
-                    kl_loss = F.kl_div(F.log_softmax(curr_logits, dim=-1),
-                                       F.softmax(ref_logits, dim=-1), reduction="batchmean")
+                    kl_loss = F.kl_div(
+                        F.log_softmax(curr_logits, dim=-1),
+                        F.softmax(ref_logits, dim=-1),
+                        reduction="batchmean",
+                    )
 
-                loss = (pol_loss
-                        + self.value_loss_coef * val_loss
-                        + self.entropy_coef * ent_loss
-                        + self.kl_coef * kl_loss) / self.grad_accum_steps
+                loss = (
+                    pol_loss
+                    + self.value_loss_coef * val_loss
+                    + self.entropy_coef * ent_loss
+                    + self.kl_coef * kl_loss
+                ) / self.grad_accum_steps
                 loss.backward()
                 accum += 1
 
@@ -339,33 +407,34 @@ class PPOTrainer:
 
     def train(self, train_data, dev_data, max_episodes: int,
               evaluator=None, hotpot_evaluator=None):
-        logger.info(f"Training: {max_episodes} eps, rollout={self.rollout_batch_size}, "
-                    f"batch={self.batch_size}, accum={self.grad_accum_steps}")
+        logger.info(
+            f"Training: {max_episodes} eps, rollout={self.rollout_batch_size}, "
+            f"batch={self.batch_size}, accum={self.grad_accum_steps}"
+        )
         ep_m = defaultdict(list)
         total, best_joint = 0, -1.0
 
         while total < max_episodes:
-            items = random.choices(train_data.data,
-                                   k=min(self.rollout_batch_size, max_episodes - total))
+            items = random.choices(
+                train_data.data,
+                k=min(self.rollout_batch_size, max_episodes - total),
+            )
             results = self.collect_rollout_batch(items)
             total += len(items)
             for r in results:
-                for k, v in r.items(): ep_m[k].append(v)
+                for k, v in r.items():
+                    ep_m[k].append(v)
 
             if len(self.buffer) >= self.batch_size * self.grad_accum_steps:
                 upd = self.update()
                 self.buffer.clear()
                 self.global_step += 1
 
-                # ③ 周期性更新 KL 参考策略
-                # 固定初始参考策略会随训练推进导致 KL 越来越大从而限制探索；
-                # 每隔 ref_update_every 步将当前策略快照为新的参考策略。
+                # 周期性更新 KL 参考策略
                 if (self.ref_policy is not None
                         and self.ref_update_every > 0
                         and self.global_step % self.ref_update_every == 0):
-                    self.ref_policy.load_state_dict(
-                        copy.deepcopy(self.policy.state_dict())
-                    )
+                    self.ref_policy.load_state_dict(copy.deepcopy(self.policy.state_dict()))
                     logger.info(f"[Step {self.global_step}] ref_policy updated")
 
                 if self.global_step % 10 == 0:
@@ -390,8 +459,9 @@ class PPOTrainer:
                     torch.save(self.policy.state_dict(), self.output_dir / "policy_best.pt")
                     logger.info(f"New best joint_recall={jt:.4f}")
                 if hotpot_evaluator is not None and self.global_step % 50 == 0:
-                    hm = hotpot_evaluator.evaluate(self.policy, self.env, dev_data,
-                                                    mode="rl", max_samples=500)
+                    hm = hotpot_evaluator.evaluate(
+                        self.policy, self.env, dev_data, mode="rl", max_samples=500
+                    )
                     logger.info(f"[Ep {total}] Official: {hm}")
 
             if total % self.save_every < self.rollout_batch_size:

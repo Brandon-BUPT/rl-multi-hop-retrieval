@@ -1,8 +1,20 @@
+# Core
 torch>=2.0.0
 transformers>=4.35.0
 datasets>=2.14.0
-faiss-cpu>=1.7.4
-rank_bm25>=0.2.2
 numpy>=1.24.0
 requests>=2.28.0
 tqdm>=4.65.0
+
+# 稀疏检索
+rank_bm25>=0.2.2
+
+# 向量索引
+faiss-cpu>=1.7.4  # GPU 版本：faiss-gpu
+
+# ── 高效编码器（推荐，替代 DPR）────────────────────────────────────────
+# 安装后自动使用 SentenceTransformerBackend（更快、更强）
+sentence-transformers>=2.6.0
+
+# 如果不想安装 sentence-transformers，
+# 可直接用 HuggingFaceBackend（无需额外依赖）

@@ -52,7 +52,14 @@ class Evaluator:
             import random
             data = random.sample(data, min(max_samples, len(data)))
 
+        total_samples = len(data)
+        if mode == "beam":
+            logger.info(f"Beam search evaluation on {total_samples} samples")
+
         results = defaultdict(list)
+        progress_cnt = 0
+        progress_log_interval = 400
+
         for item in data:
             if mode == "beam":
                 r = self._run_beam(policy, env, item, beam_size=beam_size)
@@ -60,6 +67,10 @@ class Evaluator:
                 r = self._run_episode(policy, env, item, mode=mode)
             for k, v in r.items():
                 results[k].append(v)
+
+            progress_cnt += 1
+            if mode == "beam" and progress_cnt % progress_log_interval == 0:
+                logger.info(f"Beam progress: {progress_cnt}/{total_samples} ({100*progress_cnt/total_samples:.1f}%)")
 
         policy.train()
         return {k: float(np.mean(v)) for k, v in results.items()}
@@ -227,6 +238,14 @@ class Evaluator:
                     first_sf_rank = cands.index(sf)
                     break
 
+        # Joint metrics: answer + supporting facts
+        a_em = info.get("em", 0.0)
+        a_f1 = info.get("f1", 0.0)
+        s_em = info.get("joint_recall", 0.0)
+        s_f1 = info.get("sf_f1", 0.0)
+        joint_em = float(a_em == 1.0 and s_em == 1.0)
+        joint_f1 = a_f1 * s_f1
+
         recall_at_k = {}
         for k in self.recall_k_list:
             top_k = set(state.selected_titles[:k])
@@ -240,6 +259,8 @@ class Evaluator:
             "sf_f1":           info.get("sf_f1",         0.0),
             "sf_recall":       info.get("sf_recall",     0.0),
             "joint_recall":    info.get("joint_recall",  0.0),
+            "joint_em":        joint_em,
+            "joint_f1":        joint_f1,
             "sf_hit_hop1":     info.get("sf_hit_hop1",   0.0),
             "sf_hit_hop2":     info.get("sf_hit_hop2",   0.0),
             "n_hops":          state.hop,
