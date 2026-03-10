@@ -63,10 +63,39 @@ class ExtractiveReader:
     def predict_batch(
         self,
         questions: List[str],
-        context_docs_list: List[List[Dict]]
+        context_docs_list: List[List[Dict]],
     ) -> List[str]:
-        """Batch prediction."""
+        """
+        批量预测。QA pipeline 支持 question 和 context 列表输入。
+        """
+        if not questions:
+            return []
+
+        contexts = []
+        for docs in context_docs_list:
+            if not docs:
+                contexts.append("")
+            else:
+                contexts.append(" ".join(
+                    f"{d['title']}: {d['text']}" for d in docs
+                ))
+
         results = []
-        for q, docs in zip(questions, context_docs_list):
-            results.append(self.predict(q, docs))
+
+        try:
+            outputs = self.qa_pipeline(
+                question=questions,
+                context=contexts,
+                max_answer_len=50,
+                handle_impossible_answer=True,
+            )
+
+            for out in outputs:
+                results.append(out.get("answer", "") if out else "")
+
+        except Exception as e:
+            logger.warning(f"Reader batch error: {e}, falling back to single")
+            for q, docs in zip(questions, context_docs_list):
+                results.append(self.predict(q, docs))
+
         return results

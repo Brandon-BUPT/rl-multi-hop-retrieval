@@ -148,40 +148,132 @@ class DenseGreedy:
     def select(self, query: str, pool: List[Dict], exclude: Set[str]) -> Optional[Dict]:
         avail = [d for d in pool if d["title"] not in exclude]
         if not avail: return None
-        # 编码 query
         q_emb = (self.backend.encode_query([query])
                  if hasattr(self.backend, "encode_query")
                  else self.backend.encode([query]))
-        # 编码候选文档
         doc_texts = [f"{d['title']}. {d['text'][:400]}" for d in avail]
         d_emb = (self.backend.encode_docs(doc_texts, batch_size=self.batch_size)
                  if hasattr(self.backend, "encode_docs")
                  else self.backend.encode(doc_texts, batch_size=self.batch_size))
-        # 内积相似度（已 L2 归一化 = 余弦相似度）
         scores = (q_emb @ d_emb.T).squeeze(0)
         return avail[int(scores.argmax())]
 
+    def select_batch(self, queries: List[str], pools: List[List[Dict]], 
+                     excludes: List[Set[str]]) -> List[Optional[Dict]]:
+        """
+        批量选择：对多个样本的 query 和候选文档批量编码，并行计算相似度。
+        返回每个样本选中的文档。
+        """
+        if not queries:
+            return []
 
-def evaluate_dense_greedy(data, reader, dense: DenseGreedy, max_hops=2):
+        has_encode_query = hasattr(self.backend, "encode_query")
+        
+        all_q_embs = []
+        all_doc_texts = []
+        doc_offsets = []
+        valid_mask = []
+
+        for query, pool, exclude in zip(queries, pools, excludes):
+            avail = [d for d in pool if d["title"] not in exclude]
+            doc_offsets.append(len(all_doc_texts))
+            if avail:
+                all_doc_texts.extend([f"{d['title']}. {d['text'][:400]}" for d in avail])
+                valid_mask.append(True)
+            else:
+                valid_mask.append(False)
+
+        if not all_doc_texts:
+            return [None] * len(queries)
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            q_embs = (self.backend.encode_query(queries, batch_size=self.batch_size)
+                      if has_encode_query
+                      else self.backend.encode(queries, batch_size=self.batch_size))
+            
+            d_embs = (self.backend.encode_docs(all_doc_texts, batch_size=self.batch_size)
+                      if hasattr(self.backend, "encode_docs")
+                      else self.backend.encode(all_doc_texts, batch_size=self.batch_size))
+
+        results = [None] * len(queries)
+        for i, (query, pool, exclude, offset, valid) in enumerate(
+                zip(queries, pools, excludes, doc_offsets, valid_mask)):
+            if not valid:
+                continue
+            avail = [d for d in pool if d["title"] not in exclude]
+            n_avail = len(avail)
+            q_emb = q_embs[i:i+1]
+            d_emb = d_embs[offset:offset+n_avail]
+            scores = (q_emb @ d_emb.T).squeeze(0)
+            results[i] = avail[int(scores.argmax())]
+
+        return results
+
+
+def evaluate_dense_greedy(data, reader, dense: DenseGreedy, max_hops=2, batch_size=32):
+    """
+    批量评测：收集每个 hop 的所有 query 和候选，批量编码，批量选择，
+    最后批量调用 reader 预测答案。
+    """
     results = defaultdict(list)
     total = len(data)
-    logger.info(f"Dense greedy evaluation: {total} samples")
-    for idx, item in enumerate(data):
-        if (idx+1) % 200 == 0 or idx == 0:
-            logger.info(f"Dense progress: {idx+1}/{total} ({100*(idx+1)/total:.1f}%)")
-        pool        = [{"title": t, "text": " ".join(s)} for t, s in item.get("context", [])]
-        gold_titles = set(sf[0] for sf in item["supporting_facts"])
-        gold_facts  = [(sf[0], sf[1]) for sf in item["supporting_facts"]]
-        sel_docs, sel_titles = [], []
+    logger.info(f"Dense greedy evaluation: {total} samples (batch_size={batch_size})")
+
+    for batch_start in range(0, total, batch_size):
+        batch_end = min(batch_start + batch_size, total)
+        batch_data = data[batch_start:batch_end]
+        
+        if (batch_end % 200 == 0) or batch_end == total:
+            logger.info(f"Progress: {batch_end}/{total} ({100*batch_end/total:.1f}%)")
+
+        pools = []
+        gold_titles_list = []
+        gold_facts_list = []
+        questions = []
+        
+        for item in batch_data:
+            pools.append([{"title": t, "text": " ".join(s)} for t, s in item.get("context", [])])
+            gold_titles_list.append(set(sf[0] for sf in item["supporting_facts"]))
+            gold_facts_list.append([(sf[0], sf[1]) for sf in item["supporting_facts"]])
+            questions.append(item["question"])
+
+        sel_docs_list = [[] for _ in range(len(batch_data))]
+        sel_titles_list = [[] for _ in range(len(batch_data))]
+        
         for hop in range(max_hops):
-            query = item["question"] + (" " + " ".join(sel_titles) if sel_titles else "")
-            doc = dense.select(query, pool, set(sel_titles))
-            if doc is None: break
-            sel_docs.append(doc); sel_titles.append(doc["title"])
-        predicted = reader.predict(item["question"], sel_docs) if sel_docs else ""
-        for k, v in compute_metrics(sel_docs, sel_titles, predicted,
-                                    item["answer"], gold_titles, gold_facts).items():
-            results[k].append(v)
+            queries = []
+            excludes = []
+            
+            for i, item in enumerate(batch_data):
+                query = item["question"] + (" " + " ".join(sel_titles_list[i]) if sel_titles_list[i] else "")
+                queries.append(query)
+                excludes.append(set(sel_titles_list[i]))
+
+            selected = dense.select_batch(queries, pools, excludes)
+            
+            for i, doc in enumerate(selected):
+                if doc is None:
+                    break
+                sel_docs_list[i].append(doc)
+                sel_titles_list[i].append(doc["title"])
+
+        q_indices = [i for i, docs in enumerate(sel_docs_list) if docs]
+        if q_indices:
+            batch_questions = [batch_data[i]["question"] for i in q_indices]
+            batch_sel_docs = [sel_docs_list[i] for i in q_indices]
+            
+            predicted_list = reader.predict_batch(batch_questions, batch_sel_docs)
+            
+            pred_dict = {q_indices[i]: pred for i, pred in enumerate(predicted_list)}
+        else:
+            pred_dict = {}
+
+        for i, item in enumerate(batch_data):
+            predicted = pred_dict.get(i, "")
+            for k, v in compute_metrics(sel_docs_list[i], sel_titles_list[i], predicted,
+                                        item["answer"], gold_titles_list[i], gold_facts_list[i]).items():
+                results[k].append(v)
+
     return {k: float(np.mean(v)) for k, v in results.items()}
 
 

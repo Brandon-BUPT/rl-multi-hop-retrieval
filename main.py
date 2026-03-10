@@ -85,7 +85,7 @@ def parse_args():
     )
 
     # ── 检索 ──────────────────────────────────────────────────────────────
-    p.add_argument("--reader_model",     default="deepset/roberta-base-squad2")
+    p.add_argument("--reader_model",     default="deepset/deberta-v3-large-squad2")
     p.add_argument("--freeze_layers",    type=int,   default=6,
                    help="冻结底部 N 层（-1=不冻结；与 freeze_ratio 二选一）")
     p.add_argument("--freeze_ratio",     type=float, default=0.5,
@@ -96,7 +96,7 @@ def parse_args():
                    choices=["context", "bm25", "dpr", "dense", "hybrid"])
     p.add_argument("--top_k",            type=int,   default=10)
     p.add_argument("--max_hops",         type=int,   default=2)
-    p.add_argument("--index_batch_size", type=int,   default=512)
+    p.add_argument("--index_batch_size", type=int,   default=1024)
     p.add_argument("--dense_index_type", default="flat", choices=["flat", "ivf"],
                    help="FAISS 索引类型（大语料用 ivf）")
 
@@ -109,14 +109,15 @@ def parse_args():
     p.add_argument("--gae_lambda",         type=float, default=0.95)
     p.add_argument("--lr",                 type=float, default=1e-5)
     p.add_argument("--batch_size",         type=int,   default=16)
-    p.add_argument("--rollout_batch_size", type=int,   default=64)
-    p.add_argument("--encode_batch_size",  type=int,   default=64)
+    p.add_argument("--rollout_batch_size", type=int,   default=128)
+    p.add_argument("--encode_batch_size",  type=int,   default=512)
     p.add_argument("--grad_accum_steps",   type=int,   default=4)
     p.add_argument("--max_episodes",       type=int,   default=100000)
-    p.add_argument("--eval_every",         type=int,   default=512)
-    p.add_argument("--save_every",         type=int,   default=1024)
-    p.add_argument("--ref_update_every",   type=int,   default=200)
+    p.add_argument("--eval_every",         type=int,   default=1000)
+    p.add_argument("--save_every",         type=int,   default=1000)
+    p.add_argument("--ref_update_every",   type=int,   default=500)
     p.add_argument("--beam_size",          type=int,   default=3)
+    p.add_argument("--beam_batch_coeff",   type=int,   default=128, help="beam search batch size = beam_size * beam_batch_coeff")
 
     # ── 奖励 ──────────────────────────────────────────────────────────────
     p.add_argument("--reward_em_weight",          type=float, default=0.3)
@@ -225,7 +226,7 @@ def _run_eval(args, policy, env, dev_data, encoder_backend):
         doc_prefix=args.doc_prefix,
         batch_size=args.encode_batch_size,
     )
-    dense_m = evaluate_dense_greedy(dev_raw, reader, dense_greedy, max_hops=args.max_hops)
+    dense_m = evaluate_dense_greedy(dev_raw, reader, dense_greedy, max_hops=args.max_hops, batch_size=args.encode_batch_size)
     dense_label = f"Dense Greedy ({args.encoder_model.split('/')[-1]})"
     all_results[dense_label] = dense_m
 
@@ -237,6 +238,7 @@ def _run_eval(args, policy, env, dev_data, encoder_backend):
             policy, env, dev_data,
             mode="beam",
             beam_size=args.beam_size,
+            beam_batch_coeff=args.beam_batch_coeff,
         )
         ckpt_name = Path(args.checkpoint).stem   # e.g. "policy_best"
         all_results[f"RL ({ckpt_name})"] = rl_m
